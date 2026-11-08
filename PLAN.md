@@ -1,83 +1,135 @@
 # Power Outage Tracker — Project Plan
 
-Goal: know exactly when the electricity at home went off, when it came back, and how long it was gone.
+Goal: know exactly when the electricity at home went off, when it came back, and how long it was gone. This must also work when the internet provider goes down during long outages.
 
 ## 1. How it works
 
 ```
- [ESP32 on mains power] --wifi--> [Router on UPS] --internet--> [Server] <--HTTPS-- [PWA on phone]
-        |                                                         |
-   "I'm alive" every 60 s                           detects gaps, stores outages
+ [ESP32 + RTC on mains power] --wifi--> [Router on UPS] --internet--> [Server] <--HTTPS-- [PWA on phone]
+        |                                                               |
+   - "I'm alive" heartbeat every 60 s                      - live status from heartbeats
+   - keeps its own outage log in flash                     - stores the final outage history
+   - uploads the log when the server is reachable           - merges device log with its own view
 ```
 
-1. The ESP32 is plugged into a normal wall socket (no UPS), so it dies when the power goes off.
-2. While powered, it sends a **heartbeat** to the server every 60 s.
-3. If the server gets no heartbeat for ~3 minutes, it opens an **outage** with `off time = last heartbeat`.
-4. When power returns, the ESP32 boots and sends a heartbeat right away. The server closes the outage with `on time = now − device uptime`.
-5. The PWA shows live status, history, statistics, and lets you edit, delete or annotate outages.
+The device and the server each detect outages:
+
+1. **Device (source of truth for history).** The ESP32 has a battery-backed real-time clock (RTC), so it always knows the time, even right after a power cut and with no internet.
+   - While powered, it saves a "last alive" timestamp to flash every 60 s.
+   - On boot (power returned), it creates an outage record: `off = last alive`, `on = now (RTC)`.
+   - The record goes into a local **outbox queue** in flash. It stays there until the server confirms it received it.
+2. **Server (live view and fallback).** The device sends a heartbeat every 60 s.
+   - If heartbeats stop for ~3 min, the server marks the device **unreachable** and opens a provisional outage from the last heartbeat.
+   - When the device's own records arrive (immediately, or hours later after an internet outage), they replace the provisional entry.
+3. The **PWA** shows live status, history and statistics. You can edit, delete or annotate outages there.
+
+### Problem this solves: internet outage during long power cuts
+
+The provider's equipment has its own backup battery, but it doesn't last 12+ hours. So during a long outage:
+
+```
+time ──►
+power:     ████████░░░░░░░░░░░░░░░░░░░░░░██████░░░░░░██████████████
+internet:  ██████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░░█████████
+                  ▲                     ▲      ▲     ▲      ▲  ▲
+             power off            ISP dies   power on  off  on  internet back
+                                                                 └─ device uploads queued records
+```
+
+- The server only sees "no heartbeats from power-off until internet back".
+- The device recorded every power off/on with exact RTC timestamps, including outages that happened while the internet was down.
+- After the internet returns, the device uploads the queued records. The server replaces its provisional outage with the real ones.
 
 ### Key design decisions
 
 | Decision | Why |
 |---|---|
-| **Heartbeat every 60 s** (not 5 min) | Accuracy of the off-time equals the interval. 60 s costs almost nothing (≈1,440 tiny requests/day). Configurable. |
-| **Outage threshold = 3 missed heartbeats** | Ignores single lost packets or short wifi hiccups. |
-| **`boot_id` + `uptime` in every heartbeat** | Tells a **power outage** apart from an **internet/wifi outage**. A new `boot_id` means the device restarted, so the power really went off. The same `boot_id` with growing uptime means power was fine and only the network failed. Without this, every internet drop would be recorded as a power cut. |
-| **On-time = server time − uptime** | Correct even if the internet comes back later than the power. |
-| **The server must NOT run in your house** (or must be on the UPS) | A server that loses power can't record the outage. Use a cheap VPS/free cloud tier, or a Raspberry Pi plugged into the UPS. |
-| **Server owns all timestamps** | The ESP32 doesn't need an exact clock; server time (NTP-synced) is the source of truth. |
+| **DS3231 RTC module with a coin cell** | Without internet, the ESP32 can't get the time (no NTP). Its own clock resets on every power loss. An RTC keeps accurate time (±1 min/year) through power cuts. It is synced from NTP whenever the internet is available. |
+| **"Last alive" checkpoint in flash every 60 s** | When power drops, the device dies instantly and can't write anything. The last checkpoint is the off time (±60 s). |
+| **Outbox queue in flash, deleted only after the server confirms** | No data is lost if the server or internet is unreachable for hours or days, or if power fails again before upload. |
+| **Unique ID per record (`boot_id`)** | Uploads can be retried safely; the server ignores duplicates. |
+| **Heartbeat every 60 s, unreachable after 3 missed** | Live status in the app, plus a fallback if the device or its storage fails. |
+| **"Unreachable" ≠ "power off" in the UI** | A missing heartbeat can mean no power **or** no internet. The app says "device unreachable since…" until device data confirms what happened. |
+| **Server runs outside the house** (or on the UPS) | It must stay up during outages. |
+| All times stored in **UTC** | Displayed in the home time zone. |
 
 ### Accuracy
 
-- **Off time:** between the last heartbeat and last heartbeat + 60 s. Store `last heartbeat`, optionally show "± 1 min".
-- **On time:** accurate to a few seconds (boot time + wifi connect time).
-- Want an exact off time? See the optional "last gasp" upgrade in section 2.4.
+- **Off time:** within 60 s (the checkpoint interval).
+- **On time:** within a few seconds (RTC time at boot).
+- Both work without internet. The optional "last gasp" upgrade in section 2.6 makes the off time exact.
 
 ---
 
 ## 2. ESP32 device
 
-### 2.1 Shopping list (≈ $5–15)
+### 2.1 Shopping list (≈ $8–20)
 
 | Item | Notes |
 |---|---|
-| ESP32 board | ESP32-C3 SuperMini, ESP32-DevKitC or Wemos/LOLIN D1 Mini ESP32. Any ESP32 with wifi works. |
-| 5 V USB phone charger + USB cable | Safest option: no mains wiring. Plug into a regular socket (**not** the UPS). |
+| ESP32 board | ESP32-C3 SuperMini, ESP32-DevKitC or LOLIN D1 Mini ESP32. |
+| **DS3231 RTC module + CR2032 coin cell** | ~$2–3 (e.g. the "ZS-042" board or a mini DS3231 module). Connects over I²C. **Required** for offline timestamps. |
+| 5 V USB phone charger + USB cable | Plug into a regular socket, **not** the UPS. No mains wiring needed. |
+| 4 Dupont wires | For RTC to ESP32: 3.3V, GND, SDA, SCL. |
 | Small enclosure (optional) | 3D-printed or a plastic project box. |
-| LED + 220 Ω resistor (optional) | Status light, if the board has no usable onboard LED. |
+| LED + 220 Ω resistor (optional) | Status light. |
 
-> Safety: don't wire the ESP32 to 230 V directly. A certified USB charger is enough. Plugging it into a socket also lets you choose which circuit/phase you monitor.
+> ZS-042 modules have a charging circuit meant for rechargeable LIR2032 cells. With a normal CR2032, remove the charging diode/resistor (a common, simple mod), or buy a module without charging.
 
-### 2.2 Software tools
+### 2.2 Wiring
 
-- **PlatformIO** (VS Code extension) with the **Arduino** framework. Simplest to start; ESP-IDF is possible later.
-- Libraries: `WiFi`, `HTTPClient`/`WiFiClientSecure`, `ArduinoJson`, `WiFiManager` (setup portal), `ArduinoOTA` or HTTP OTA (optional).
+```
+DS3231      ESP32
+VCC   ───── 3.3V
+GND   ───── GND
+SDA   ───── SDA pin (e.g. GPIO8 on ESP32-C3 SuperMini, GPIO21 on DevKitC)
+SCL   ───── SCL pin (e.g. GPIO9 on ESP32-C3 SuperMini, GPIO22 on DevKitC)
+```
 
-### 2.3 Firmware behaviour
+### 2.3 Software tools
 
-1. On boot: generate a random `boot_id` (`esp_random()`), and start the uptime counter.
-2. Connect to wifi. If no credentials are saved, open a **WiFiManager captive portal** (an "OutageTracker-Setup" access point) to enter wifi SSID/password, server URL and device API key. Save them to NVS (flash).
-3. Send a heartbeat **immediately**, then every `HEARTBEAT_INTERVAL` (60 s):
-   ```http
-   POST https://your-server/api/v1/heartbeat
-   X-Device-Key: <secret>
-   {"device_id":"home-1","boot_id":"a1b2c3d4","uptime_s":12345,"seq":205,"rssi":-61,"fw":"1.0.0"}
+- **PlatformIO** (VS Code extension), **Arduino** framework.
+- Libraries: `WiFi`, `HTTPClient`/`WiFiClientSecure`, `ArduinoJson`, `RTClib` (DS3231), `LittleFS` (flash file system), `Preferences` (NVS), `WiFiManager` (setup portal), optional OTA.
+
+### 2.4 Firmware behaviour
+
+**On boot:**
+1. Read the time from the RTC. If the RTC lost time (battery dead or never set), mark `time_valid = false` (see 2.5).
+2. Generate a random `boot_id`.
+3. Read the last "last alive" checkpoint from flash. If there is one, create an outage record and add it to the outbox:
+   ```json
+   {"id":"<boot_id>","type":"outage","off":"2026-11-08T03:14:00Z","on":"2026-11-08T17:42:05Z","time_valid":true}
    ```
-4. Retry on failure with backoff. Reconnect wifi automatically.
-5. **Hardware watchdog**: reboot if the firmware hangs.
-6. LED: blinking = connecting, solid = OK, fast blink = server error.
-7. Optional: the server's reply can change the interval, so you don't need to reflash.
-8. Optional: OTA firmware updates.
+4. Connect to wifi. If no credentials are saved, open the WiFiManager portal to enter wifi, server URL and API key.
 
-Don't write to flash on each heartbeat; it wears out the flash. Nothing needs to be stored per heartbeat.
+**Main loop:**
+- **Every 60 s:** write the "last alive" checkpoint (current RTC time) to flash.
+- **Every 60 s:** send a heartbeat if wifi is up:
+  ```http
+  POST /api/v1/heartbeat
+  X-Device-Key: <secret>
+  {"device_id":"home-1","boot_id":"a1b2c3d4","uptime_s":12345,"rtc_time":"...","pending":3,"rssi":-61,"fw":"1.1.0"}
+  ```
+- **Outbox flush:** whenever the outbox isn't empty and the server is reachable, upload up to 50 records in one request: `POST /api/v1/events`. Delete only the IDs the server returns as accepted. If the server is unreachable, retry with backoff (30 s → 1 min → 2 min … max 10 min).
+- **Time sync:** when the internet is available, sync NTP every 6 h and update the RTC if it is off by more than 2 s.
+- **Internet up/down log (optional):** record `net_down` / `net_up` events. This lets the app also show internet-outage periods.
+- Hardware watchdog, automatic wifi reconnect, status LED.
 
-### 2.4 Optional v2 upgrade: "last gasp" (exact off time)
+### 2.5 Local storage details
 
-Add a small energy reserve so the ESP32 can report the moment power drops:
-- A small LiPo + TP4056 charger module (or a 1–5 F supercapacitor), plus
-- a voltage divider from the USB 5 V line to a GPIO to detect "USB power lost".
+| What | Where | Size / wear |
+|---|---|---|
+| Config (wifi, server URL, API key) | NVS (`Preferences`) | Tiny. |
+| "Last alive" checkpoint | NVS, overwriting one key | 1 write/min. NVS spreads writes across its pages (wear leveling): with a 64 KB+ NVS partition, ~525k writes/year use only a small part of the flash's ~100k erase cycles per page. That's years of life. For unlimited writes, an FRAM chip (FM24CL64, ~$3) is an optional upgrade. |
+| Outbox queue | LittleFS file `/outbox.jsonl`, one JSON line per record | ~100 bytes/record. 1 MB holds ~10,000 records (years of outages). If it ever fills up, the oldest records are dropped first. |
 
-When 5 V disappears, the device immediately sends `{"event":"power_lost"}` and then goes to sleep. This gives an exact off time. The heartbeat logic stays as the fallback.
+**Crash safety:** write records with "write new file → rename" or append + flush. A power cut during a write then can't corrupt the queue. A record is only deleted after the server confirms it.
+
+**Without valid RTC time** (coin cell dead): fall back to relative time. A record from the *current* boot is sent with `uptime_s` and the server computes `on = server time − uptime`. A gap that spans earlier boots is marked `approximate`, and the app shows a "replace RTC battery" warning.
+
+### 2.6 Optional upgrade: "last gasp" (exact off time)
+
+Add a small LiPo + TP4056 charger (or a 1–5 F supercapacitor) and a voltage divider from USB 5 V to a GPIO. When 5 V disappears, the device writes an exact `power_off` record to flash (and sends it, if online), then sleeps. This replaces the ±60 s checkpoint with an exact time.
 
 ---
 
@@ -85,103 +137,114 @@ When 5 V disappears, the device immediately sends `{"event":"power_lost"}` and t
 
 ### 3.1 Recommended stack
 
-| Part | Choice | Alternatives |
-|---|---|---|
-| Language | **TypeScript + Node.js (Fastify)**: same language as the PWA | Python + FastAPI |
-| Database | **SQLite** (one file; plenty for one house) | PostgreSQL |
-| ORM | Drizzle or Prisma | — |
-| Hosting | Small VPS (Hetzner/DigitalOcean ~$4–5/mo) or Oracle Cloud free tier, in **Docker** | Raspberry Pi on the UPS + Cloudflare Tunnel |
-| HTTPS | **Caddy** reverse proxy (automatic Let's Encrypt). PWAs require HTTPS. | Cloudflare |
+| Part | Choice |
+|---|---|
+| Language | **TypeScript + Node.js (Fastify)** (Python + FastAPI also fine) |
+| Database | **SQLite** |
+| ORM | Drizzle or Prisma |
+| Hosting | Small VPS (~$4–5/mo) or free cloud tier in **Docker**, or a Raspberry Pi on the UPS + Cloudflare Tunnel |
+| HTTPS | **Caddy** (automatic Let's Encrypt) |
 
-The server also hosts the built PWA files, so there is a single deployment.
+The server also hosts the built PWA.
 
 ### 3.2 Data model
 
 ```
 devices
   id, name, api_key_hash, heartbeat_interval_s (60), offline_threshold_s (180),
-  last_seen_at, last_boot_id, last_uptime_s, last_rssi, fw_version, created_at
+  status ('online' | 'unreachable' | 'paused'),
+  last_seen_at, last_boot_id, last_uptime_s, pending_events, rssi, fw_version,
+  rtc_ok (bool), created_at
 
 outages
   id, device_id,
-  started_at            -- off time
-  ended_at   (nullable) -- on time; NULL = ongoing
-  duration_s (computed when closed)
-  kind       -- 'power' | 'network' | 'unknown'
-  source     -- 'auto' | 'manual'
-  note       (text)
-  edited     (bool), created_at, updated_at, deleted_at (soft delete)
+  started_at, ended_at (NULL = ongoing / unknown yet), duration_s,
+  kind        -- 'power' | 'network'
+  source      -- 'device' (from device log) | 'server' (provisional, from heartbeat gap) | 'manual'
+  confidence  -- 'exact' | 'approximate' | 'provisional'
+  device_event_id (unique, nullable)  -- for idempotent uploads
+  note, edited (bool), created_at, updated_at, deleted_at
 
-monitoring_periods          -- for "stop/start server"
-  id, paused_at, resumed_at (nullable), reason
+device_events        -- raw uploaded records, for audit/debug (optional)
+  id (device event id), device_id, type, payload_json, received_at
 
-settings / users
-  single user: username, password_hash; push subscriptions
+monitoring_periods   -- pause/resume
+  id, paused_at, resumed_at, reason
+
+users / settings / push_subscriptions
 ```
 
-Optional: a `heartbeats` table with raw heartbeats, auto-deleted after 30 days. It's useful for debugging. Otherwise only `last_seen` is needed.
+### 3.3 Detection and merge logic
 
-### 3.3 Outage detection logic (the core)
-
-Device status: `ONLINE` → `OFFLINE` → `ONLINE`, or `PAUSED` when monitoring is stopped.
-
-**Watchdog job (every 30 s):**
+**Watchdog (every 30 s):**
 ```
-if monitoring enabled
-   and device ONLINE
-   and now - last_seen_at > offline_threshold_s:
-       create outage(started_at = last_seen_at, ended_at = NULL, kind = 'unknown')
-       status = OFFLINE
-       send push notification "Power off since HH:MM" (optional)
+if monitoring on and device online and now - last_seen_at > threshold:
+    status = 'unreachable'
+    create outage(started_at = last_seen_at, ended_at = NULL,
+                  source = 'server', confidence = 'provisional')
+    push: "Home device unreachable since 14:32 (power or internet)"
 ```
 
-**On heartbeat:**
+**Heartbeat received:**
 ```
-validate API key
-if open outage exists:
-    if boot_id != last_boot_id:          # device rebooted -> real power outage
-        ended_at = now - uptime_s
-        kind = 'power'
-    else:                                 # same boot -> only network was down
-        ended_at = now
-        kind = 'network'                  # hidden by default in UI / stats
-    duration_s = ended_at - started_at
-    push "Power is back, was off 2h 13m"
-elif boot_id != last_boot_id and last_seen_at is set:
-    # rebooted but the gap was shorter than the threshold (short blink or manual replug)
-    optionally record a short 'power' outage from last_seen_at to now - uptime_s
-update last_seen_at, last_boot_id, uptime, rssi
+update last_seen_at, boot_id, uptime, pending_events, ...
+status = 'online'
+if open provisional outage exists:
+    if boot_id is the same as before:   # device never rebooted -> power was fine
+        close it: kind = 'network', ended_at = now
+    else:
+        # device rebooted -> power outage; wait for the device's records,
+        # which normally arrive in the same minute
+        leave it open until events arrive (or close with ended_at = now - uptime
+        after 10 min as a fallback, confidence = 'approximate')
 ```
 
-**Pause ("stop server"):** while monitoring is paused, the watchdog creates no outages, and heartbeats only update `last_seen`. On resume, the device needs one fresh heartbeat before detection starts again, so the time you were unplugged isn't counted. The HTTP server itself keeps running so the PWA still works. Stopping the process or container entirely is possible but not recommended.
+**Events upload `POST /api/v1/events`:**
+```
+for each record:
+    if device_event_id already exists -> accepted (duplicate), skip
+    if type == 'outage':
+        find server-provisional outages for this device overlapping [off - 2 min, on + 2 min]
+        - if a provisional outage covers several device outages (internet was down
+          between them), the part between device outages was a network outage:
+          replace the provisional entry with the device outages, and optionally
+          save the gaps as kind='network'
+        - keep the user's note/edits if the provisional entry was edited
+        insert outage(source='device', confidence = time_valid ? 'exact' : 'approximate')
+    if type in ('net_down','net_up'): store as network periods (optional)
+return {"accepted": [ids...]}
+```
+All of this runs in one database transaction, so a failed request changes nothing and the device simply retries.
 
-**Server restart safety:** on startup, if `now − last_seen` is already past the threshold, open the outage from `last_seen`. Then a server outage doesn't lose data.
+**Pause ("stop server"):** while paused, no provisional outages are created. Device records with `off`/`on` inside a paused period are stored as hidden (or ignored, configurable). The HTTP server keeps running.
+
+**Server restart safety:** on startup, apply the watchdog check immediately.
 
 ### 3.4 REST API
 
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/api/v1/heartbeat` | Device heartbeat (device API key) |
-| POST | `/api/auth/login` / `logout` | PWA login → httpOnly session cookie |
-| GET | `/api/status` | Current state, last seen, ongoing outage, monitoring on/off, device info |
-| GET | `/api/outages?from=&to=&kind=&page=` | List outages |
-| POST | `/api/outages` | Manually add an outage |
+| POST | `/api/v1/events` | **Batch upload of the device's queued records → returns accepted IDs** |
+| GET | `/api/v1/time` | Server time (backup time source for the device) |
+| POST | `/api/auth/login` / `logout` | PWA login (httpOnly cookie) |
+| GET | `/api/status` | State (online/unreachable/paused), last seen, ongoing outage, pending device events, RTC health |
+| GET | `/api/outages?from=&to=&kind=&page=` | List |
+| POST | `/api/outages` | Manual add |
 | PATCH | `/api/outages/:id` | Edit start/end/note/kind |
-| DELETE | `/api/outages/:id` | Delete (soft delete) |
-| GET | `/api/stats?period=today\|week\|7d\|month\|30d\|year\|custom&from=&to=` | Total off time, count, longest, average, availability %, per-day totals |
-| POST | `/api/monitoring` `{enabled: bool, reason?}` | Pause/resume monitoring |
-| GET | `/api/export.csv?from=&to=` | Export |
-| POST | `/api/push/subscribe` | Web Push subscription (optional) |
+| DELETE | `/api/outages/:id` | Soft delete |
+| GET | `/api/stats?period=today\|week\|7d\|month\|30d\|year\|custom&from=&to=` | Totals, count, longest, average, availability %, per-day breakdown |
+| POST | `/api/monitoring` `{enabled, reason?}` | Pause/resume |
+| GET | `/api/export.csv` | Export |
+| POST | `/api/push/subscribe` | Web Push |
 
-Notes:
-- Stats clip outages to the period boundaries, so an outage that crosses midnight is split correctly between days.
-- Use the home **time zone** (e.g. `Europe/Kyiv`) as a setting for "today/week/month" boundaries. Store everything in UTC.
+Stats count only `kind = 'power'` by default. They split outages correctly at day/month boundaries, using the home time zone.
 
 ### 3.5 Security
 
-- Device: a long random API key, stored hashed on the server, sent over HTTPS only.
-- PWA: single-user login (bcrypt/argon2 password), httpOnly + Secure cookie, rate-limited login.
-- Daily SQLite backup (e.g. `sqlite3 .backup` via cron to another location).
+- Device API key (long, random, stored hashed), HTTPS only.
+- Single-user login (argon2/bcrypt), Secure httpOnly cookie, rate-limited login.
+- Daily SQLite backup.
 
 ---
 
@@ -189,48 +252,44 @@ Notes:
 
 ### 4.1 Stack
 
-- **React + Vite + TypeScript**, **vite-plugin-pwa** (manifest + service worker, installable on the phone home screen).
-- UI: Tailwind CSS (or MUI). Charts: Recharts or Chart.js. Dates: date-fns / dayjs with time zone support.
-- Data fetching: TanStack Query, auto-refresh status every 30 s.
+React + Vite + TypeScript, **vite-plugin-pwa**, Tailwind CSS, Recharts/Chart.js, dayjs (time zones), TanStack Query (status refresh every 30 s).
 
 ### 4.2 Screens
 
 1. **Dashboard**
-   - Large status card: 🟢 *Power ON* / 🔴 *Power OFF since 14:32 (1h 12m, live timer)* / ⏸ *Monitoring paused*.
-   - Last heartbeat, wifi signal, firmware version.
-   - Quick totals: today, this week, this month (off time and number of outages).
+   - Status card:
+     - 🟢 **Power ON**
+     - 🟠 **Device unreachable since 03:14 (14h 28m)**: "power or internet is down; the exact data will sync when the device is back online"
+     - 🔴 **Power OFF**: only shown when it is confirmed (e.g. by a last-gasp record)
+     - ⏸ **Monitoring paused**
+   - Last heartbeat, wifi signal, firmware, **queued records on device**, **RTC battery OK / replace**.
+   - Quick totals: today, this week, this month.
 2. **History**
-   - List grouped by day: `14:32 → 16:45 · 2h 13m · note`. An ongoing outage is shown at the top.
-   - Filters: period (today, current week, last 7 days, month, year, custom range) and kind (power/network).
-   - Tap an outage to edit start/end, add a note, change kind, or delete (with confirm and undo).
-   - "+ Add outage" button for manual entries.
+   - List grouped by day: `03:14 → 17:42 · 14h 28m · note`, with badges: *provisional*, *approximate*, *manual*, *network*.
+   - Filters: period (today, current week, last 7 days, month, year, custom) and kind (power / network / all).
+   - Tap to edit start/end, add a note, change kind, or delete (with undo). "+ Add outage" button.
 3. **Statistics**
-   - Period selector: current week / last 7 days / current month / last 30 days / year / custom.
-   - Total time without power, number of outages, longest, average, % time with power.
-   - Bar chart of off-hours per day (or per month for the year view).
-   - Optional: a timeline/heatmap of the day (hours × days), handy for seeing scheduled-outage patterns.
+   - Period selector, total time without power, count, longest, average, % time with power.
+   - Bar chart per day (per month for a year view). Optional hour × day heatmap.
+   - Optional: internet downtime shown separately.
 4. **Settings**
-   - **Monitoring on/off** toggle (the "stop/start server"), with an optional reason.
-   - Device info, heartbeat interval, offline threshold, time zone.
-   - Push notifications on/off.
-   - Export CSV. Change password.
+   - **Monitoring on/off** toggle ("stop/start server") with an optional reason.
+   - Device info, intervals, time zone, push notifications, CSV export, password.
 
 ### 4.3 PWA specifics
 
-- Manifest: name, icons (192/512), `display: standalone`, theme color.
-- Service worker: cache the app shell for instant load. Show the last known data when offline, clearly marked as stale.
-- **Web Push** (optional but very useful): a notification when the power goes off or comes back. Works on Android, and on iOS 16.4+ once the app is installed to the home screen.
+Manifest + icons, standalone display. The service worker caches the app shell and the last data (shown as stale when offline). Web Push for: unreachable, power back, data synced ("Sync complete: 2 outages added, 14h 28m total").
 
 ---
 
 ## 5. Repository structure
 
 ```
-/firmware     PlatformIO project (ESP32)
+/firmware     PlatformIO project (ESP32 + DS3231)
 /server       Fastify + SQLite API (+ serves the built PWA)
 /web          React + Vite PWA
 /deploy       docker-compose.yml, Caddyfile, backup script
-/docs         wiring photo/diagram, API description
+/docs         wiring diagram, API description
 PLAN.md
 ```
 
@@ -240,29 +299,32 @@ PLAN.md
 
 | # | Phase | Result |
 |---|---|---|
-| 1 | **Server MVP**: heartbeat endpoint, SQLite, detection logic + unit tests, `/api/status`, `/api/outages` | Outages recorded (test with `curl` simulating a device) |
-| 2 | **Firmware MVP**: wifi + heartbeat with `boot_id`/uptime, hardcoded config | Real device reporting |
-| 3 | **Deploy**: Docker + Caddy on a VPS, HTTPS, backups | Runs 24/7 outside the house |
-| 4 | **PWA v1**: login, dashboard, history with edit/delete/note, pause toggle | Usable daily |
+| 1 | **Server MVP**: heartbeat + events endpoints, SQLite, watchdog, merge logic with unit tests, status/outages API | Logic tested with `curl`/scripts simulating a device |
+| 2 | **Firmware MVP**: wifi, heartbeat, DS3231 + NTP sync, checkpoint, outbox in LittleFS, upload + retry | Device survives power and internet outages without data loss |
+| 3 | **Deploy**: Docker + Caddy on a VPS, HTTPS, backups | Runs 24/7 |
+| 4 | **PWA v1**: login, dashboard, history with edit/delete/note, pause toggle | Daily use |
 | 5 | **Stats**: periods, charts, CSV export | Full reporting |
-| 6 | **Polish**: WiFiManager setup portal, OTA, Web Push notifications, LED status | Comfortable to use |
-| 7 | *(optional)* Last-gasp hardware, multiple devices/phases, Telegram bot notifications | Extras |
+| 6 | **Polish**: WiFiManager portal, OTA, Web Push, LED, RTC battery warning | Comfort |
+| 7 | *(optional)* last-gasp hardware, FRAM, several devices/phases, Telegram bot | Extras |
 
 ### Testing checklist
 
-- Unplug the ESP32 for 10 min → outage ≈ 10 min recorded, kind = power.
-- Turn off the router wifi for 10 min while the ESP32 stays powered → recorded as **network**, not power.
-- Unplug for 1 min (below the threshold) → short outage handled as designed.
-- Pause monitoring → unplug → replug → resume → no outage recorded.
-- Restart the server during an outage → outage still recorded correctly.
-- An outage crossing midnight or a month boundary → stats split correctly.
+- Unplug the ESP32 for 10 min → 1 power outage ≈ 10 min, `source = device`, `confidence = exact`.
+- Unplug the router's WAN/internet cable (simulates the provider outage), then unplug and replug the ESP32 **several times**, then restore the internet → every outage appears with correct times, and the provisional entry is replaced.
+- Internet down for 30 min while the ESP32 stays powered → recorded as **network**, no power outage.
+- Server down for 1 h during an outage → records upload when the server is back; no duplicates.
+- Power fails again **during** an upload → no lost or duplicated records after the next boot.
+- Remove the RTC coin cell → records marked approximate, warning shown in the app.
+- Pause monitoring → unplug → replug → resume → no outage counted.
+- Outage across midnight or a month boundary → stats split correctly.
 
 ---
 
-## 7. Open questions to decide
+## 7. Open questions
 
 1. Hosting: VPS / free cloud tier, or a Raspberry Pi on the UPS?
-2. Heartbeat interval: 60 s (recommended) or something else?
-3. One device or several (e.g. one per phase in a 3-phase house)? The data model already supports several.
-4. Notifications: Web Push, Telegram bot, or both?
-5. Is the "last gasp" hardware upgrade worth it for exact off times?
+2. Heartbeat/checkpoint interval: 60 s OK?
+3. One device or several (per phase)?
+4. Notifications: Web Push, Telegram, or both?
+5. Track internet-outage periods in the app too, or only power?
+6. Is the "last gasp" upgrade worth it for exact off times?
