@@ -57,7 +57,7 @@ internet:  ██████████████████████░
 
 - **Off time:** within 60 s (the checkpoint interval).
 - **On time:** within a few seconds (RTC time at boot).
-- Both work without internet. The optional "last gasp" upgrade in section 2.6 makes the off time exact.
+- Both work without internet. The optional "last gasp" upgrade in section 2.7 makes the off time exact.
 
 ---
 
@@ -70,9 +70,9 @@ internet:  ██████████████████████░
 | ESP32 board | ESP32-C3 SuperMini, ESP32-DevKitC or LOLIN D1 Mini ESP32. |
 | **DS3231 RTC module + CR2032 coin cell** | ~$2–3 (e.g. the "ZS-042" board or a mini DS3231 module). Connects over I²C. **Required** for offline timestamps. |
 | 5 V USB phone charger + USB cable | Plug into a regular socket, **not** the UPS. No mains wiring needed. |
-| 4 Dupont wires | For RTC to ESP32: 3.3V, GND, SDA, SCL. |
+| ~8 Dupont wires | RTC (4) + RGB LED (4). |
 | Small enclosure (optional) | 3D-printed or a plastic project box. |
-| LED + 220 Ω resistor (optional) | Status light. |
+| RGB LED module (optional, recommended) | Status light, e.g. KY-016 / KY-009 (4 pins: R, G, B, common). Add ~220 Ω resistors if the module has none. |
 
 > ZS-042 modules have a charging circuit meant for rechargeable LIR2032 cells. With a normal CR2032, remove the charging diode/resistor (a common, simple mod), or buy a module without charging.
 
@@ -82,19 +82,40 @@ internet:  ██████████████████████░
 DS3231      ESP32
 VCC   ───── 3.3V
 GND   ───── GND
-SDA   ───── SDA pin (e.g. GPIO8 on ESP32-C3 SuperMini, GPIO21 on DevKitC)
-SCL   ───── SCL pin (e.g. GPIO9 on ESP32-C3 SuperMini, GPIO22 on DevKitC)
+SDA   ───── GPIO6 on ESP32-C3 SuperMini / GPIO21 on DevKitC
+SCL   ───── GPIO7 on ESP32-C3 SuperMini / GPIO22 on DevKitC
+
+RGB LED     ESP32-C3 SuperMini  (DevKitC)
+R     ───── GPIO3               (GPIO25)
+G     ───── GPIO4               (GPIO26)
+B     ───── GPIO5               (GPIO27)
+-  / +  ─── GND if common cathode ("-" pin); 3.3V if common anode ("+" pin)
 ```
 
-### 2.3 Software tools
+Pin notes for the ESP32-C3 SuperMini: avoid GPIO8 (onboard LED; it would flicker with RTC traffic), GPIO2/9 (boot pins) and GPIO18/19 (USB). The C3 can put I²C on any pins, so GPIO6/7 is fine.
+
+### 2.3 Status LED
+
+The RGB LED is driven with PWM (`ledcWrite`), so any color and brightness work. Keep brightness low (~10–20%) so it doesn't light up the room at night. With a common-anode module the logic is inverted (0 = full on); this is set by one flag in the firmware.
+
+| State | Color / pattern |
+|---|---|
+| Booting / connecting to wifi | Blue, slow blink |
+| Online, everything OK | Green short flash every 10 s (or fully off, configurable) |
+| No internet / server unreachable, records queued | Orange double flash every 5 s |
+| Uploading queued records | Blue, fast blink |
+| Setup portal active (no wifi configured) | Purple, blink |
+| Error: RTC missing or lost time, storage error | Red, blink |
+
+### 2.4 Software tools
 
 - **PlatformIO** (VS Code extension), **Arduino** framework.
 - Libraries: `WiFi`, `HTTPClient`/`WiFiClientSecure`, `ArduinoJson`, `RTClib` (DS3231), `LittleFS` (flash file system), `Preferences` (NVS), `WiFiManager` (setup portal), optional OTA.
 
-### 2.4 Firmware behaviour
+### 2.5 Firmware behaviour
 
 **On boot:**
-1. Read the time from the RTC. If the RTC lost time (battery dead or never set), mark `time_valid = false` (see 2.5).
+1. Read the time from the RTC. If the RTC lost time (battery dead or never set), mark `time_valid = false` (see 2.6).
 2. Generate a random `boot_id`.
 3. Read the last "last alive" checkpoint from flash. If there is one, create an outage record and add it to the outbox:
    ```json
@@ -113,9 +134,9 @@ SCL   ───── SCL pin (e.g. GPIO9 on ESP32-C3 SuperMini, GPIO22 on DevKi
 - **Outbox flush:** whenever the outbox isn't empty and the server is reachable, upload up to 50 records in one request: `POST /api/v1/events`. Delete only the IDs the server returns as accepted. If the server is unreachable, retry with backoff (30 s → 1 min → 2 min … max 10 min).
 - **Time sync:** when the internet is available, sync NTP every 6 h and update the RTC if it is off by more than 2 s.
 - **Internet up/down log (optional):** record `net_down` / `net_up` events. This lets the app also show internet-outage periods.
-- Hardware watchdog, automatic wifi reconnect, status LED.
+- Hardware watchdog, automatic wifi reconnect, RGB status LED (see 2.3).
 
-### 2.5 Local storage details
+### 2.6 Local storage details
 
 | What | Where | Size / wear |
 |---|---|---|
@@ -127,7 +148,7 @@ SCL   ───── SCL pin (e.g. GPIO9 on ESP32-C3 SuperMini, GPIO22 on DevKi
 
 **Without valid RTC time** (coin cell dead): fall back to relative time. A record from the *current* boot is sent with `uptime_s` and the server computes `on = server time − uptime`. A gap that spans earlier boots is marked `approximate`, and the app shows a "replace RTC battery" warning.
 
-### 2.6 Optional upgrade: "last gasp" (exact off time)
+### 2.7 Optional upgrade: "last gasp" (exact off time)
 
 Add a small LiPo + TP4056 charger (or a 1–5 F supercapacitor) and a voltage divider from USB 5 V to a GPIO. When 5 V disappears, the device writes an exact `power_off` record to flash (and sends it, if online), then sleeps. This replaces the ±60 s checkpoint with an exact time.
 
